@@ -1052,8 +1052,7 @@ fn parse_selector<'i, 't, P, E, Impl>(
     'outer_loop: loop {
         // Parse a sequence of simple selectors.
         parsed_pseudo_element =
-            parse_compound_selector(parser, input, &mut sequence,
-                                    /* inside_negation = */ false)?;
+            parse_compound_selector(parser, input, &mut sequence)?;
         if parsed_pseudo_element {
             break;
         }
@@ -1120,8 +1119,8 @@ impl<Impl: SelectorImpl> Selector<Impl> {
 }
 
 /// * `Err(())`: Invalid selector, abort
-/// * `Ok(None)`: Not a type selector, could be something else. `input` was not consumed.
-/// * `Ok(Some(vec))`: Length 0 (`*|*`), 1 (`*|E` or `ns|*`) or 2 (`|E` or `ns|E`)
+/// * `Ok(false)`: Not a type selector, could be something else. `input` was not consumed.
+/// * `Ok(true)`: Length 0 (`*|*`), 1 (`*|E` or `ns|*`) or 2 (`|E` or `ns|E`)
 fn parse_type_selector<'i, 't, P, E, Impl>(parser: &P, input: &mut CssParser<'i, 't>,
                                            sequence: &mut ParseVec<Impl>)
                                            -> Result<bool, ParseError<'i, SelectorParseError<'i, E>>>
@@ -1423,14 +1422,40 @@ fn parse_negation<'i, 't, P, E, Impl>(parser: &P,
                                                 ParseError<'i, SelectorParseError<'i, E>>>
     where P: Parser<'i, Impl=Impl, Error=E>, Impl: SelectorImpl
 {
-    let mut v = ParseVec::new();
-    parse_compound_selector(parser, input, &mut v, /* inside_negation = */ true)?;
+    // We use a sequence because a type selector may be represented as two Components.
+    let mut sequence = ParseVec::new();
 
-    if single_simple_selector(&v) {
-        Ok(Component::Negation(v.into_vec().into_boxed_slice()))
-    } else {
-        Err(ParseError::Custom(SelectorParseError::NonSimpleSelectorInNegation))
+    // Consume any leading whitespace.
+    loop {
+        let position = input.position();
+        if !matches!(input.next_including_whitespace(), Ok(Token::WhiteSpace(_))) {
+            input.reset(position);
+            break
+        }
     }
+
+    // Get exactly one simple selector.
+    if !parse_type_selector(parser, input, &mut sequence)? {
+        match parse_one_simple_selector(parser, input, /* inside_negation = */ true)? {
+            Some(SimpleSelectorParseResult::SimpleSelector(s)) => {
+                sequence.push(s);
+            },
+            None => {
+                return Err(ParseError::Custom(SelectorParseError::EmptySelector));
+            },
+            Some(SimpleSelectorParseResult::PseudoElement(_)) => {
+                return Err(ParseError::Custom(SelectorParseError::NonSimpleSelectorInNegation));
+            }
+        }
+    }
+
+    // Additional selectors are forbiden.
+    if !parse_one_simple_selector(parser, input, /* inside_negation = */ true)?.is_none() {
+        return Err(ParseError::Custom(SelectorParseError::NonSimpleSelectorInNegation));
+    }
+
+    // Success.
+    Ok(Component::Negation(sequence.into_vec().into_boxed_slice()))
 }
 
 // A single type selector can be represented as two components
@@ -1463,8 +1488,7 @@ fn single_simple_selector<Impl: SelectorImpl>(v: &[Component<Impl>]) -> bool {
 fn parse_compound_selector<'i, 't, P, E, Impl>(
     parser: &P,
     input: &mut CssParser<'i, 't>,
-    mut sequence: &mut ParseVec<Impl>,
-    inside_negation: bool)
+    mut sequence: &mut ParseVec<Impl>)
     -> Result<bool, ParseError<'i, SelectorParseError<'i, E>>>
     where P: Parser<'i, Impl=Impl, Error=E>, Impl: SelectorImpl
 {
@@ -1482,11 +1506,7 @@ fn parse_compound_selector<'i, 't, P, E, Impl>(
             // If there was no explicit type selector, but there is a
             // default namespace, there is an implicit "<defaultns>|*" type
             // selector.
-            //
-            // Note that this doesn't apply to :not() and :matches() per spec.
-            if !inside_negation {
-                sequence.push(Component::DefaultNamespace(url))
-            }
+            sequence.push(Component::DefaultNamespace(url))
         }
     } else {
         empty = false;
@@ -1494,7 +1514,7 @@ fn parse_compound_selector<'i, 't, P, E, Impl>(
 
     let mut pseudo = false;
     loop {
-        match parse_one_simple_selector(parser, input, inside_negation)? {
+        match parse_one_simple_selector(parser, input, /* inside_negation = */ false)? {
             None => break,
             Some(SimpleSelectorParseResult::SimpleSelector(s)) => {
                 sequence.push(s);
